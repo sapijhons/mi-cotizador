@@ -6,9 +6,12 @@ Cada conversión se guarda en la colección "consultas" de PocketBase.
 
 import json
 import os
+import queue
 import re
 import secrets
 import sys
+import threading
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -45,6 +48,8 @@ def cargar_env(carpetas=None):
 
 cargar_env()
 POCKETBASE_URL = (os.environ.get("POCKETBASE_URL") or "http://127.0.0.1:8090").rstrip("/")
+DOLARAPI_URL = os.environ.get("DOLARAPI_URL") or "https://dolarapi.com/v1/dolares/oficial"
+ESPERA_MAXIMA_COTIZACION = 15  # segundos
 LARGO_MINIMO_PASSWORD = 8  # El mínimo que exige la colección "users" de PocketBase.
 
 MENSAJES_VALIDACION = {
@@ -219,6 +224,35 @@ def listar_consultas(sesion, cantidad=50, url_base=None):
     return respuesta["items"]
 
 
+class ErrorCotizacion(Exception):
+    pass
+
+
+def obtener_cotizacion_oficial(url=None):
+    """Devuelve el JSON de dolarapi.com: compra, venta y fechaActualizacion."""
+    url = url or DOLARAPI_URL
+    # dolarapi.com rechaza (403) la identificación por defecto de Python.
+    pedido = urllib.request.Request(
+        url, headers={"User-Agent": f"{NOMBRE_APP}/1.0", "Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(pedido, timeout=10) as respuesta:
+            dato = json.loads(respuesta.read().decode("utf-8"))
+        venta = float(dato["venta"])
+        dato["fechaActualizacion"]  # Que exista; se muestra en pantalla.
+    except (urllib.error.URLError, OSError) as e:
+        raise ErrorCotizacion(
+            "No se pudo conectar con dolarapi.com.\n"
+            "Revisá tu conexión a internet o escribí la cotización a mano."
+        ) from e
+    except (ValueError, KeyError, TypeError) as e:
+        raise ErrorCotizacion("dolarapi.com devolvió una respuesta inesperada.") from e
+    if venta <= 0:
+        raise ErrorCotizacion("dolarapi.com devolvió una cotización inválida.")
+    dato["venta"] = venta
+    return dato
+
+
 def fecha_local(texto):
     """'2026-11-16 22:13:02.123Z' (UTC) -> '16/11/2026 19:13' en la hora de esta compu."""
     return datetime.fromisoformat(texto.replace(" ", "T")).astimezone().strftime("%d/%m/%Y %H:%M")
@@ -312,15 +346,24 @@ class PantallaConversor(ttk.Frame):
         self.pesos = _campo(self, 1, "Monto en pesos (ARS):")
         self.cotizacion = _campo(self, 2, "Cotización del dólar:")
 
+        oficial = ttk.Frame(self)
+        oficial.grid(column=0, row=3, columnspan=2, sticky="e")
+        self.estado_cotizacion = ttk.Label(oficial, text="", foreground="gray")
+        self.estado_cotizacion.grid(column=0, row=0, padx=(0, 8))
+        self.boton_actualizar = ttk.Button(
+            oficial, text="Actualizar cotización", command=self.actualizar_cotizacion
+        )
+        self.boton_actualizar.grid(column=1, row=0)
+
         ttk.Button(self, text="Convertir", command=self.accion_principal).grid(
-            column=0, row=3, columnspan=2, pady=12
+            column=0, row=4, columnspan=2, pady=12
         )
 
         self.resultado = ttk.Label(self, text="", font=("Helvetica", 16))
-        self.resultado.grid(column=0, row=4, columnspan=2)
+        self.resultado.grid(column=0, row=5, columnspan=2)
 
         ttk.Label(self, text="Mi historial", font=("Helvetica", 13, "bold")).grid(
-            column=0, row=5, columnspan=2, sticky="w", pady=(16, 4)
+            column=0, row=6, columnspan=2, sticky="w", pady=(16, 4)
         )
         self.historial = ttk.Treeview(
             self, columns=("fecha", "monto", "cotizacion", "resultado"),
@@ -334,16 +377,61 @@ class PantallaConversor(ttk.Frame):
         ):
             self.historial.heading(columna, text=titulo)
             self.historial.column(columna, width=ancho, anchor=alineacion)
-        self.historial.grid(column=0, row=6, columnspan=2)
+        self.historial.grid(column=0, row=7, columnspan=2)
 
         ttk.Label(self, text=f"Sesión: {self.usuario['email']}", foreground="gray").grid(
-            column=0, row=7, columnspan=2, pady=(12, 0)
+            column=0, row=8, columnspan=2, pady=(12, 0)
         )
         if es_admin(sesion):
-            _enlace(self, 8, "Volver al panel de admin", lambda: app.mostrar(PantallaAdmin, sesion=sesion))
-        _enlace(self, 9, "Cerrar sesión", lambda: app.mostrar(PantallaLogin))
+            _enlace(self, 9, "Volver al panel de admin", lambda: app.mostrar(PantallaAdmin, sesion=sesion))
+        _enlace(self, 10, "Cerrar sesión", lambda: app.mostrar(PantallaLogin))
         self.pesos.focus()
         self.cargar_historial()
+        self.actualizar_cotizacion(automatica=True)
+
+    def actualizar_cotizacion(self, automatica=False):
+        """Pide la cotización en segundo plano para que la ventana no se congele."""
+        self.boton_actualizar.state(["disabled"])
+        self.estado_cotizacion.config(text="Buscando dólar oficial…")
+        respuesta = queue.Queue(maxsize=1)
+
+        def buscar():
+            try:
+                respuesta.put(obtener_cotizacion_oficial())
+            except ErrorCotizacion as e:
+                respuesta.put(e)
+
+        threading.Thread(target=buscar, daemon=True).start()
+        # El timeout de urlopen no cubre la búsqueda DNS, así que ponemos un límite propio.
+        limite = time.monotonic() + ESPERA_MAXIMA_COTIZACION
+        self.after(100, self._esperar_cotizacion, respuesta, automatica, limite)
+
+    def _esperar_cotizacion(self, respuesta, automatica, limite):
+        if not self.winfo_exists():  # Se cerró la sesión mientras esperaba.
+            return
+        try:
+            dato = respuesta.get_nowait()
+        except queue.Empty:
+            if time.monotonic() < limite:
+                self.after(100, self._esperar_cotizacion, respuesta, automatica, limite)
+                return
+            dato = ErrorCotizacion(
+                "dolarapi.com tardó demasiado en responder.\n"
+                "Probá de nuevo o escribí la cotización a mano."
+            )
+        self.boton_actualizar.state(["!disabled"])
+        if isinstance(dato, ErrorCotizacion):
+            self.estado_cotizacion.config(text="No se pudo traer el dólar oficial")
+            if not automatica:
+                messagebox.showerror(NOMBRE_APP, str(dato))
+            return
+        # Al abrir no pisamos una cotización que el usuario ya haya escrito.
+        if not automatica or not self.cotizacion.get().strip():
+            self.cotizacion.delete(0, "end")
+            self.cotizacion.insert(0, formatear(dato["venta"]))
+        self.estado_cotizacion.config(
+            text=f"Dólar oficial (venta) · {fecha_local(dato['fechaActualizacion'])}"
+        )
 
     def cargar_historial(self):
         try:
