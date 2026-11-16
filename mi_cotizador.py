@@ -1,6 +1,7 @@
 """Mi Cotizador: convierte pesos a dólares y guarda un historial.
 
 Para usar el conversor hay que iniciar sesión con un usuario de PocketBase.
+Cada conversión se guarda en la colección "consultas" de PocketBase.
 """
 
 import json
@@ -11,13 +12,9 @@ import tkinter as tk
 import urllib.error
 import urllib.request
 from datetime import datetime
-from pathlib import Path
 from tkinter import messagebox, ttk
 
 NOMBRE_APP = "Mi Cotizador"
-# Fuera del .app para que el historial sobreviva a actualizaciones y sea fácil de encontrar.
-CARPETA_HISTORIAL = Path.home() / "Documents" / NOMBRE_APP
-ARCHIVO_HISTORIAL = CARPETA_HISTORIAL / "historial.txt"
 
 POCKETBASE_URL = os.environ.get("POCKETBASE_URL", "http://127.0.0.1:8090").rstrip("/")
 LARGO_MINIMO_PASSWORD = 8  # El mínimo que exige la colección "users" de PocketBase.
@@ -169,22 +166,34 @@ def formatear(valor):
     return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def guardar_en_historial(
-    pesos, cotizacion, dolares, usuario=None, archivo=None, ahora=None
-):
-    archivo = archivo or ARCHIVO_HISTORIAL
-    ahora = ahora or datetime.now()
-    archivo.parent.mkdir(parents=True, exist_ok=True)
-    linea = (
-        f"{ahora:%Y-%m-%d %H:%M:%S} | ARS {formatear(pesos)} | "
-        f"cotización {formatear(cotizacion)} | USD {formatear(dolares)}"
+def guardar_consulta(sesion, pesos, cotizacion, dolares, url_base=None):
+    return _pedir(
+        "/api/collections/consultas/records",
+        {
+            "usuario": sesion["record"]["id"],
+            "monto": pesos,
+            "cotizacion": cotizacion,
+            "resultado": dolares,
+        },
+        url_base,
+        token=sesion["token"],
     )
-    if usuario:
-        linea += f" | {usuario}"
-    linea += "\n"
-    with open(archivo, "a", encoding="utf-8") as f:
-        f.write(linea)
-    return linea
+
+
+def listar_consultas(sesion, cantidad=50, url_base=None):
+    """Las más recientes primero. PocketBase devuelve solo las del usuario de la sesión."""
+    respuesta = _pedir(
+        f"/api/collections/consultas/records?perPage={cantidad}&sort=-fecha",
+        url_base=url_base,
+        metodo="GET",
+        token=sesion["token"],
+    )
+    return respuesta["items"]
+
+
+def fecha_local(texto):
+    """'2026-11-16 22:13:02.123Z' (UTC) -> '16/11/2026 19:13' en la hora de esta compu."""
+    return datetime.fromisoformat(texto.replace(" ", "T")).astimezone().strftime("%d/%m/%Y %H:%M")
 
 
 # --- Interfaz -----------------------------------------------------------------
@@ -268,6 +277,7 @@ class PantallaConversor(ttk.Frame):
     def __init__(self, app, sesion):
         super().__init__(app, padding=20)
         self.app = app
+        self.sesion = sesion
         self.usuario = sesion["record"]
         _titulo(self, NOMBRE_APP)
 
@@ -281,17 +291,46 @@ class PantallaConversor(ttk.Frame):
         self.resultado = ttk.Label(self, text="", font=("Helvetica", 16))
         self.resultado.grid(column=0, row=4, columnspan=2)
 
-        ttk.Label(
-            self, text=f"Historial: {ARCHIVO_HISTORIAL}", foreground="gray", wraplength=340
-        ).grid(column=0, row=5, columnspan=2, pady=(12, 0))
+        ttk.Label(self, text="Mi historial", font=("Helvetica", 13, "bold")).grid(
+            column=0, row=5, columnspan=2, sticky="w", pady=(16, 4)
+        )
+        self.historial = ttk.Treeview(
+            self, columns=("fecha", "monto", "cotizacion", "resultado"),
+            show="headings", height=8, selectmode="none",
+        )
+        for columna, titulo, ancho, alineacion in (
+            ("fecha", "Fecha y hora", 130, "w"),
+            ("monto", "Pesos", 110, "e"),
+            ("cotizacion", "Cotización", 90, "e"),
+            ("resultado", "Dólares", 90, "e"),
+        ):
+            self.historial.heading(columna, text=titulo)
+            self.historial.column(columna, width=ancho, anchor=alineacion)
+        self.historial.grid(column=0, row=6, columnspan=2)
 
         ttk.Label(self, text=f"Sesión: {self.usuario['email']}", foreground="gray").grid(
-            column=0, row=6, columnspan=2, pady=(12, 0)
+            column=0, row=7, columnspan=2, pady=(12, 0)
         )
         if es_admin(sesion):
-            _enlace(self, 7, "Volver al panel de admin", lambda: app.mostrar(PantallaAdmin, sesion=sesion))
-        _enlace(self, 8, "Cerrar sesión", lambda: app.mostrar(PantallaLogin))
+            _enlace(self, 8, "Volver al panel de admin", lambda: app.mostrar(PantallaAdmin, sesion=sesion))
+        _enlace(self, 9, "Cerrar sesión", lambda: app.mostrar(PantallaLogin))
         self.pesos.focus()
+        self.cargar_historial()
+
+    def cargar_historial(self):
+        try:
+            consultas = listar_consultas(self.sesion)
+        except ErrorPocketBase as e:
+            messagebox.showwarning(NOMBRE_APP, f"No se pudo cargar el historial:\n{e}")
+            return
+        self.historial.delete(*self.historial.get_children())
+        for c in consultas:
+            self.historial.insert("", "end", values=(
+                fecha_local(c["fecha"]),
+                formatear(c["monto"]),
+                formatear(c["cotizacion"]),
+                formatear(c["resultado"]),
+            ))
 
     def accion_principal(self):
         try:
@@ -308,9 +347,11 @@ class PantallaConversor(ttk.Frame):
 
         self.resultado.config(text=f"USD {formatear(dolares)}")
         try:
-            guardar_en_historial(pesos, cotizacion, dolares, usuario=self.usuario["email"])
-        except OSError as e:
-            messagebox.showwarning(NOMBRE_APP, f"No se pudo guardar el historial:\n{e}")
+            guardar_consulta(self.sesion, pesos, cotizacion, dolares)
+        except ErrorPocketBase as e:
+            messagebox.showwarning(NOMBRE_APP, f"No se pudo guardar en el historial:\n{e}")
+            return
+        self.cargar_historial()
 
 
 class PantallaAdmin(ttk.Frame):
