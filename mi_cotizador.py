@@ -8,15 +8,43 @@ import json
 import os
 import re
 import secrets
+import sys
 import tkinter as tk
 import urllib.error
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 NOMBRE_APP = "Mi Cotizador"
 
-POCKETBASE_URL = os.environ.get("POCKETBASE_URL", "http://127.0.0.1:8090").rstrip("/")
+
+def _carpetas_del_env():
+    if getattr(sys, "frozen", False):
+        # Ejecutable: .../dist/Mi Cotizador.app/Contents/MacOS/Mi Cotizador
+        app = Path(sys.executable).resolve().parents[2]
+        return [app.parent, app.parent.parent]
+    return [Path(__file__).resolve().parent]
+
+
+def cargar_env(carpetas=None):
+    """Lee el primer .env que encuentre. Las variables ya definidas en el sistema tienen prioridad."""
+    for carpeta in carpetas or _carpetas_del_env():
+        archivo = carpeta / ".env"
+        if not archivo.is_file():
+            continue
+        for linea in archivo.read_text(encoding="utf-8").splitlines():
+            linea = linea.strip()
+            if not linea or linea.startswith("#") or "=" not in linea:
+                continue
+            clave, valor = linea.split("=", 1)
+            os.environ.setdefault(clave.strip(), valor.strip().strip("\"'"))
+        return archivo
+    return None
+
+
+cargar_env()
+POCKETBASE_URL = (os.environ.get("POCKETBASE_URL") or "http://127.0.0.1:8090").rstrip("/")
 LARGO_MINIMO_PASSWORD = 8  # El mínimo que exige la colección "users" de PocketBase.
 
 MENSAJES_VALIDACION = {

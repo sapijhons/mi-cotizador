@@ -8,3 +8,4 @@ __pycache__/
 .claude/settings.local.json
 pocketbase/*
 !pocketbase/pb_migrations/
+.env
