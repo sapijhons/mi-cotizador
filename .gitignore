@@ -6,3 +6,5 @@ dist/
 __pycache__/
 .DS_Store
 .claude/settings.local.json
+pocketbase/*
+!pocketbase/pb_migrations/
